@@ -51,6 +51,7 @@ from typing import Dict, Optional, Any, List, Union
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from gateway.platforms.base import is_silent_reply_text
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -15825,7 +15826,12 @@ class GatewayRunner:
                         or _previewed
                     )
                     first_response = result.get("final_response", "")
-                    if first_response and not _already_streamed:
+                    if first_response and is_silent_reply_text(first_response):
+                        logger.info(
+                            "Queued follow-up for session %s: suppressing silent reply marker before continuing.",
+                            session_key or "?",
+                        )
+                    elif first_response and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",

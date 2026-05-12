@@ -68,6 +68,13 @@ class TestCleanForDisplay:
         result = GatewayStreamConsumer._clean_for_display(text)
         assert result.strip() == ""
 
+    def test_no_reply_marker_is_hidden(self):
+        assert GatewayStreamConsumer._clean_for_display("NO_REPLY").strip() == ""
+
+    def test_no_reply_json_marker_is_hidden(self):
+        text = ' {"action":"NO_REPLY"} '
+        assert GatewayStreamConsumer._clean_for_display(text).strip() == ""
+
     def test_media_mid_sentence(self):
         """MEDIA: tag embedded in prose is stripped cleanly."""
         text = "I generated this image MEDIA:/tmp/art.png for you."

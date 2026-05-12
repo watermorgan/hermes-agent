@@ -681,19 +681,35 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- DingTalk media path ---
+    if platform == Platform.DINGTALK and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_dingtalk(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and dingtalk; "
                 f"target {platform.value} had only media attachments"
             )
         }
     warning = None
-    if media_files:
+    if media_files and platform != Platform.DINGTALK:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and dingtalk"
         )
 
     last_result = None
@@ -1593,19 +1609,124 @@ async def _send_homeassistant(token, extra, chat_id, message):
         return _error(f"Home Assistant send failed: {e}")
 
 
-async def _send_dingtalk(extra, chat_id, message):
-    """Send via DingTalk robot webhook.
+async def _send_dingtalk(extra, chat_id, message, media_files=None):
+    """Send via DingTalk robot webhook or file upload API.
 
-    Note: The gateway's DingTalk adapter uses per-session webhook URLs from
-    incoming messages (dingtalk-stream SDK).  For cross-platform send_message
-    delivery we use a static robot webhook URL instead, which must be
-    configured via ``DINGTALK_WEBHOOK_URL`` env var or ``webhook_url`` in the
-    platform's extra config.
+    For text: uses static webhook URL (DINGTALK_WEBHOOK_URL env var).
+    For files: uploads to DingTalk media API and sends as sampleFile message
+    (requires DINGTALK_CLIENT_ID/SECRET for access token).
     """
+    import json as _json
+
     try:
         import httpx
     except ImportError:
         return {"error": "httpx not installed"}
+
+    media_files = media_files or []
+
+    # --- File/media send path ---
+    if media_files:
+        client_id = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
+        client_secret = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            return {"error": "DingTalk file send requires DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET"}
+
+        try:
+            # Get access token
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                token_resp = await client.post(
+                    "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                    json={"appKey": client_id, "appSecret": client_secret},
+                )
+                token_data = token_resp.json()
+                token = token_data.get("accessToken")
+                if not token:
+                    return _error(f"Failed to get DingTalk access token: {token_data}")
+
+                results = []
+                for media_path, _is_voice in media_files:
+                    from pathlib import Path
+                    p = Path(media_path)
+                    if not p.exists():
+                        results.append({"error": f"File not found: {media_path}"})
+                        continue
+
+                    fname = p.name
+                    ext = p.suffix.lower()
+                    media_type = "file"
+                    if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp"):
+                        media_type = "image"
+
+                    # Upload to DingTalk media API
+                    upload_url = f"https://oapi.dingtalk.com/media/upload?access_token={token}&type={media_type}"
+                    file_bytes = p.read_bytes()
+                    upload_resp = await client.post(
+                        upload_url,
+                        files={"media": (fname, file_bytes)},
+                        timeout=60.0,
+                    )
+                    if upload_resp.status_code >= 300:
+                        results.append({"error": f"Upload failed: {upload_resp.text[:200]}"})
+                        continue
+                    media_id = upload_resp.json().get("media_id")
+                    if not media_id:
+                        results.append({"error": f"No media_id: {upload_resp.text}"})
+                        continue
+
+                    # Send file message via robot API
+                    msg_param = _json.dumps({"mediaId": media_id, "fileName": fname, "fileType": "file"})
+                    headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
+
+                    # Try DM first, then group
+                    send_payload = {
+                        "robotCode": client_id,
+                        "userIds": [chat_id],
+                        "msgKey": "sampleFile",
+                        "msgParam": msg_param,
+                    }
+                    send_resp = await client.post(
+                        "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+                        json=send_payload,
+                        headers=headers,
+                        timeout=15.0,
+                    )
+                    if send_resp.status_code >= 300:
+                        # Fallback: try as group message
+                        group_payload = {
+                            "openConversationId": chat_id,
+                            "robotCode": client_id,
+                            "msgKey": "sampleFile",
+                            "msgParam": msg_param,
+                        }
+                        send_resp = await client.post(
+                            "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
+                            json=group_payload,
+                            headers=headers,
+                            timeout=15.0,
+                        )
+                    results.append({
+                        "success": send_resp.status_code < 300,
+                        "file": fname,
+                        "status": send_resp.status_code,
+                    })
+
+                # Also send text message if provided
+                if message.strip():
+                    webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
+                    if webhook_url:
+                        await client.post(
+                            webhook_url,
+                            json={"msgtype": "text", "text": {"content": message}},
+                            timeout=15.0,
+                        )
+
+                return {"success": all(r.get("success") for r in results), "files": results, "platform": "dingtalk"}
+
+        except Exception as e:
+            return _error(f"DingTalk file send failed: {e}")
+
+    # --- Text-only send path ---
     try:
         webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
         if not webhook_url:

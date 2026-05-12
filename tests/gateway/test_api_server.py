@@ -209,6 +209,17 @@ class TestAdapterInit:
         assert adapter._api_key == ""
         assert adapter.platform == Platform.API_SERVER
 
+    def test_platform_config_preserves_top_level_api_server_options(self):
+        config = PlatformConfig.from_dict({
+            "enabled": True,
+            "key": "sk-top-level",
+            "cors_origins": "*",
+            "extra": {"host": "127.0.0.1", "port": 8642},
+        })
+        adapter = APIServerAdapter(config)
+        assert adapter._api_key == "sk-top-level"
+        assert adapter._cors_origins == ("*",)
+
     def test_custom_config_from_extra(self):
         config = PlatformConfig(
             enabled=True,

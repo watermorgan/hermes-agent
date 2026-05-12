@@ -452,6 +452,31 @@ class ProcessRegistry:
             except (OSError, ProcessLookupError, PermissionError):
                 pass
 
+    @staticmethod
+    def _kill_popen_tree(proc: subprocess.Popen) -> None:
+        """Kill a local Popen process and any known children."""
+        if _IS_WINDOWS:
+            proc.kill()
+            return
+
+        try:
+            import psutil
+        except ImportError:
+            proc.kill()
+            return
+        try:
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.kill()
+        except psutil.NoSuchProcess:
+            proc.kill()
+        except (OSError, PermissionError):
+            proc.kill()
+
     # ----- Spawn -----
 
     @staticmethod
@@ -583,13 +608,7 @@ class ProcessRegistry:
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
-                if not _IS_WINDOWS:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
+                self._kill_popen_tree(proc)
             except Exception:
                 pass
             try:

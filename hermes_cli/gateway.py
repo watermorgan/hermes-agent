@@ -1284,10 +1284,12 @@ def _profile_suffix() -> str:
 
 
 def _profile_arg(hermes_home: str | None = None) -> str:
-    """Return ``--profile <name>`` only when HERMES_HOME is a named profile.
+    """Return an explicit ``--profile`` argument for service processes.
 
     For ``~/.hermes/profiles/<name>``, returns ``"--profile <name>"``.
-    For the default profile or hash-based custom paths, returns the empty string.
+    For the default profile, returns ``"--profile default"`` so launchd/systemd
+    services are not affected by a user-level ``active_profile`` switch.
+    For hash-based custom paths, returns the empty string.
 
     Args:
         hermes_home: Optional explicit HERMES_HOME path. Defaults to the current
@@ -1299,7 +1301,7 @@ def _profile_arg(hermes_home: str | None = None) -> str:
     home = Path(hermes_home or str(get_hermes_home())).resolve()
     default = get_default_hermes_root().resolve()
     if home == default:
-        return ""
+        return "--profile default"
     profiles_root = (default / "profiles").resolve()
     try:
         rel = home.relative_to(profiles_root)

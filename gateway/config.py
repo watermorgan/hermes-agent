@@ -304,6 +304,11 @@ class PlatformConfig:
         if "home_channel" in data:
             home_channel = HomeChannel.from_dict(data["home_channel"])
 
+        extra = dict(data.get("extra", {}) or {})
+        for key in ("key", "host", "port", "cors_origins", "model_name"):
+            if key in data and key not in extra:
+                extra[key] = data[key]
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -313,7 +318,7 @@ class PlatformConfig:
             gateway_restart_notification=_coerce_bool(
                 data.get("gateway_restart_notification"), True
             ),
-            extra=data.get("extra", {}),
+            extra=extra,
         )
 
 

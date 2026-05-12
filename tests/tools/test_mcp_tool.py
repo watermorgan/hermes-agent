@@ -3237,6 +3237,22 @@ class TestMCPSelectiveToolLoading:
         assert "mcp_ink_resources_only_list_prompts" not in registered
         assert "mcp_ink_resources_only_get_prompt" not in registered
 
+    def test_utility_tools_follow_initialize_capabilities_when_available(self):
+        from tools.mcp_tool import _select_utility_schemas
+
+        session = SimpleNamespace(
+            list_resources=AsyncMock(),
+            read_resource=AsyncMock(),
+            list_prompts=AsyncMock(),
+            get_prompt=AsyncMock(),
+        )
+        server = _make_mock_server("srv", session=session)
+        server._capabilities = SimpleNamespace(tools=SimpleNamespace())
+
+        selected = _select_utility_schemas("srv", server, {})
+
+        assert selected == []
+
     def test_existing_tool_names_reflect_registered_subset(self):
         from tools.mcp_tool import _existing_tool_names, _servers, _discover_and_register_server
         from tools.registry import ToolRegistry

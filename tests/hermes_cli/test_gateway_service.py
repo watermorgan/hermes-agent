@@ -38,6 +38,10 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    @pytest.fixture(autouse=True)
+    def _mock_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -737,6 +741,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _mock_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 
@@ -1582,14 +1590,14 @@ class TestPreflightUserSystemd:
 class TestProfileArg:
     """Tests for _profile_arg — returns '--profile <name>' for named profiles."""
 
-    def test_default_hermes_home_returns_empty(self, tmp_path, monkeypatch):
-        """Default ~/.hermes should not produce a --profile flag."""
+    def test_default_hermes_home_returns_default_profile_flag(self, tmp_path, monkeypatch):
+        """Default ~/.hermes should explicitly pin service processes."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         result = gateway_cli._profile_arg(str(hermes_home))
-        assert result == ""
+        assert result == "--profile default"
 
     def test_named_profile_returns_flag(self, tmp_path, monkeypatch):
         """~/.hermes/profiles/mybot should return '--profile mybot'."""
@@ -1648,6 +1656,16 @@ class TestProfileArg:
         plist = gateway_cli.generate_launchd_plist()
         assert "<string>--profile</string>" in plist
         assert "<string>mybot</string>" in plist
+
+    def test_launchd_plist_includes_default_profile(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        plist = gateway_cli.generate_launchd_plist()
+        assert "<string>--profile</string>" in plist
+        assert "<string>default</string>" in plist
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"

@@ -34,6 +34,7 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -760,7 +761,24 @@ class DingTalkAdapter(BasePlatformAdapter):
                                 if msg_type == MessageType.TEXT:
                                     msg_type = MessageType.DOCUMENT
 
+        # Handle standalone file messages (e.g. PDF sent to bot)
+        # The SDK puts unrecognized msgtype content into extensions dict
         msg_type_str = getattr(message, "message_type", "") or ""
+        if msg_type_str == "file" and not media_urls:
+            extensions = getattr(message, "extensions", {})
+            file_content = extensions.get("content", {})
+            if isinstance(file_content, dict):
+                dl_code = file_content.get("downloadCode", "")
+                if dl_code:
+                    media_urls.append(dl_code)
+                    file_name = file_content.get("fileName", "")
+                    media_types.append(
+                        "application/pdf"
+                        if file_name.lower().endswith(".pdf")
+                        else "application/octet-stream"
+                    )
+                    msg_type = MessageType.DOCUMENT
+
         if msg_type_str == "picture" and not media_urls:
             msg_type = MessageType.PHOTO
         elif msg_type_str == "richText":
@@ -919,13 +937,15 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """DingTalk webhook replies cannot send local image files directly."""
-        return SendResult(
-            success=False,
-            error=(
-                "DingTalk session webhook replies do not support local image uploads. "
-                "Only markdown/text replies are supported without OpenAPI media upload."
-            ),
+        """Upload a local image and send it through DingTalk media delivery."""
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            file_name=Path(image_path).name,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
         )
 
     async def send_document(
@@ -938,14 +958,118 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """DingTalk webhook replies cannot send local file attachments directly."""
-        return SendResult(
-            success=False,
-            error=(
-                "DingTalk session webhook replies do not support local file attachments. "
-                "Only markdown/text replies are supported without OpenAPI message send."
-            ),
-        )
+        """Upload a local file and send it as a DingTalk file message.
+
+        Override of BasePlatformAdapter.send_document.
+        Flow: 1) upload to oapi.dingtalk.com/media/upload → media_id
+              2) send via robot API batchSend (DM) or groupMessages/send
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+
+        token = await self._get_access_token()
+        if not token:
+            return SendResult(success=False, error="No access token")
+
+        path = Path(file_path)
+        if not path.exists():
+            return SendResult(success=False, error=f"File not found: {file_path}")
+
+        fname = file_name or path.name
+
+        # Determine media type from extension
+        ext = path.suffix.lower()
+        if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp"):
+            media_type = "image"
+        elif ext in (".mp3", ".amr", ".wav"):
+            media_type = "voice"
+        else:
+            media_type = "file"
+
+        # Step 1: Upload to DingTalk media API
+        upload_url = f"https://oapi.dingtalk.com/media/upload?access_token={token}&type={media_type}"
+        try:
+            file_bytes = path.read_bytes()
+
+            files = {"media": (fname, file_bytes)}
+            resp = await self._http_client.post(upload_url, files=files, timeout=60.0)
+            if resp.status_code >= 300:
+                return SendResult(
+                    success=False,
+                    error=f"Media upload failed HTTP {resp.status_code}: {resp.text[:200]}",
+                )
+            data = resp.json()
+            media_id = data.get("media_id")
+            if not media_id:
+                return SendResult(
+                    success=False,
+                    error=f"No media_id in upload response: {data}",
+                )
+            logger.info("[%s] Uploaded %s → media_id=%s", self.name, fname, media_id)
+        except Exception as e:
+            logger.error("[%s] File upload error: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+        # Step 2: Send via robot message API
+        msg_key = "sampleFile"
+        msg_param = json.dumps({"mediaId": media_id, "fileName": fname, "fileType": "file"})
+
+        headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
+
+        try:
+            # Check conversation type from cached message context
+            ctx = self._message_contexts.get(chat_id)
+            is_group = False
+            if ctx:
+                conv_type = getattr(ctx, "conversation_type", "1")
+                is_group = str(conv_type) == "2"
+
+            if is_group:
+                send_url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                payload = {
+                    "openConversationId": chat_id,
+                    "robotCode": self._robot_code,
+                    "msgKey": msg_key,
+                    "msgParam": msg_param,
+                }
+            else:
+                send_url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                # For DM, use senderStaffId (same as OpenClaw)
+                user_id = None
+                if ctx:
+                    user_id = getattr(ctx, "sender_staff_id", None) or getattr(
+                        ctx, "chatbot_user_id", None
+                    ) or getattr(ctx, "sender_id", None)
+                if not user_id:
+                    return SendResult(
+                        success=False,
+                        error="Cannot determine user ID for DM file send",
+                    )
+                payload = {
+                    "robotCode": self._robot_code,
+                    "userIds": [user_id],
+                    "msgKey": msg_key,
+                    "msgParam": msg_param,
+                }
+
+            resp = await self._http_client.post(
+                send_url, json=payload, headers=headers, timeout=15.0
+            )
+            if resp.status_code < 300:
+                logger.info("[%s] File sent successfully: %s", self.name, fname)
+                return SendResult(success=True, message_id=f"file:{media_id}")
+            else:
+                body = resp.text
+                logger.warning(
+                    "[%s] File send failed HTTP %d: %s",
+                    self.name, resp.status_code, body[:200],
+                )
+                return SendResult(
+                    success=False, error=f"HTTP {resp.status_code}: {body[:200]}"
+                )
+        except Exception as e:
+            logger.error("[%s] File send error: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about a DingTalk conversation."""
@@ -1271,6 +1395,12 @@ class DingTalkAdapter(BasePlatformAdapter):
                     for key in ("downloadCode", "pictureDownloadCode", "download_code"):
                         if item.get(key):
                             codes_to_resolve.append((item, key))
+
+        # 3. Standalone file messages (PDF, etc.) stored in extensions
+        extensions = getattr(message, "extensions", {})
+        file_content = extensions.get("content", {})
+        if isinstance(file_content, dict) and file_content.get("downloadCode"):
+            codes_to_resolve.append((file_content, "downloadCode"))
 
         if not codes_to_resolve:
             return

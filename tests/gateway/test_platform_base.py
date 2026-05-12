@@ -10,6 +10,7 @@ from gateway.platforms.base import (
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    is_silent_reply_text,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -21,6 +22,20 @@ class TestSecretCaptureGuidance:
         message = GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
         assert "local cli" in message.lower()
         assert "~/.hermes/.env" in message
+
+
+class TestSilentReplyText:
+    def test_exact_no_reply_is_suppressed(self):
+        assert is_silent_reply_text("NO_REPLY") is True
+        assert is_silent_reply_text("  no_reply  ") is True
+
+    def test_json_no_reply_is_suppressed(self):
+        assert is_silent_reply_text('{"action":"NO_REPLY"}') is True
+        assert is_silent_reply_text(' { "action": "no_reply", "note": "internal" } ') is True
+
+    def test_substantive_text_is_not_suppressed(self):
+        assert is_silent_reply_text("The literal NO_REPLY token leaked.") is False
+        assert is_silent_reply_text('{"action":"reply","text":"NO_REPLY"}') is False
 
 
 class TestSafeUrlForLog:
@@ -403,6 +418,22 @@ class TestShouldSendMediaAsAudio:
         assert should_send_media_as_audio(Platform.TELEGRAM, ".flac") is False
         assert should_send_media_as_audio(Platform.DISCORD, ".flac") is True
 
+    def test_media_tag_ignores_code_examples(self):
+        content = (
+            "Use this format:\n"
+            "```text\nMEDIA:/path/to/audio.ogg\n```\n"
+            "Do not upload the example."
+        )
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert "MEDIA:/path/to/audio.ogg" in cleaned
+
+    def test_media_tag_must_start_directive_line(self):
+        content = "The value `MEDIA:/tmp/example.ogg` is just documentation."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
+
 
 # ---------------------------------------------------------------------------
 # truncate_message
@@ -728,4 +759,3 @@ class TestProxyKwargsForAiohttp:
             sess_kw, req_kw = proxy_kwargs_for_aiohttp("http://proxy:8080")
             assert sess_kw == {}
             assert req_kw == {"proxy": "http://proxy:8080"}
-

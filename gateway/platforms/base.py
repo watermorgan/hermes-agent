@@ -8,6 +8,7 @@ and implement the required methods.
 import asyncio
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -107,6 +108,37 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
     return True
+
+
+_SILENT_REPLY_SENTINEL = "NO_REPLY"
+
+
+def is_silent_reply_text(text: str) -> bool:
+    """Return True when *text* is a delivery-suppression sentinel.
+
+    Hermes historically used plain-text final responses for messaging
+    platforms. Some skills and prompts emit ``NO_REPLY`` (or a small JSON
+    envelope carrying ``{"action":"NO_REPLY"}``) to indicate that no user-
+    visible text should be sent. Treat those markers as internal control
+    signals, not end-user content.
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.upper() == _SILENT_REPLY_SENTINEL:
+        return True
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        payload = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    action = str(payload.get("action", "")).strip().upper()
+    return action == _SILENT_REPLY_SENTINEL
 
 
 def utf16_len(s: str) -> int:
@@ -2061,22 +2093,42 @@ class BasePlatformAdapter(ABC):
         # keep it out of the user-visible cleaned text.
         cleaned = cleaned.replace("[[as_document]]", "")
         
-        # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
-        # and quoted/backticked paths for LLM-formatted outputs.
+        code_spans: list = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', cleaned, re.DOTALL):
+            code_spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', cleaned):
+            code_spans.append((m.start(), m.end()))
+
+        def _in_code(pos: int) -> bool:
+            return any(start <= pos < end for start, end in code_spans)
+
+        # Extract MEDIA:<path> directive lines, allowing optional whitespace
+        # after the colon and quoted paths for LLM-formatted outputs.  Anchoring
+        # to line start avoids treating examples or JSON snippets as files.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''(?m)^[ \t]*[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?[ \t]*(?:\r?\n|$)'''
         )
-        for match in media_pattern.finditer(content):
+        media_spans = []
+        for match in media_pattern.finditer(cleaned):
+            if _in_code(match.start()):
+                continue
             path = match.group("path").strip()
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
             if path:
                 media.append((os.path.expanduser(path), has_voice_tag))
+                media_spans.append(match.span())
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
-        if media:
-            cleaned = media_pattern.sub('', cleaned)
+        if media_spans:
+            pieces = []
+            cursor = 0
+            for start, end in media_spans:
+                pieces.append(cleaned[cursor:start])
+                cursor = end
+            pieces.append(cleaned[cursor:])
+            cleaned = ''.join(pieces)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
@@ -2101,6 +2153,7 @@ class BasePlatformAdapter(ABC):
         _LOCAL_MEDIA_EXTS = (
             '.png', '.jpg', '.jpeg', '.gif', '.webp',
             '.mp4', '.mov', '.avi', '.mkv', '.webm',
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx',
         )
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
@@ -2996,6 +3049,13 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                if is_silent_reply_text(text_content):
+                    logger.info(
+                        "[%s] Suppressing silent reply marker for %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                    text_content = ""
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

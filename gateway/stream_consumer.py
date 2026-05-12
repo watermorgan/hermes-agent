@@ -31,6 +31,8 @@ from gateway.config import (
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
 
+from gateway.platforms.base import is_silent_reply_text
+
 logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
@@ -608,6 +610,8 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
+        if is_silent_reply_text(text):
+            return ""
         if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
             return text
         cleaned = text.replace("[[audio_as_voice]]", "")
