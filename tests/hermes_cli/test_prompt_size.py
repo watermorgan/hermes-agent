@@ -94,6 +94,43 @@ def test_memory_and_profile_are_attributed(isolated_home):
     assert data["user_profile"]["bytes"] > 0
 
 
+def test_breakdown_honors_platform_toolsets(isolated_home):
+    """Tool-schema diagnostics must use the same per-platform toolset config as sessions."""
+    (isolated_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: MiniMax-M3\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - file\n",
+        encoding="utf-8",
+    )
+
+    data = compute_prompt_breakdown("cli")
+    tool_names = set(data["tools"]["names"])
+
+    assert {"read_file", "write_file", "search_files", "patch"} <= tool_names
+    assert "terminal" not in tool_names
+    assert "execute_code" not in tool_names
+    assert "clarify" not in tool_names
+    assert "web_search" not in tool_names
+
+
+def test_breakdown_discovers_mcp_tools(isolated_home, monkeypatch):
+    """Direct prompt-size calls should not depend on CLI startup for MCP discovery."""
+    import tools.mcp_tool
+
+    calls = []
+    monkeypatch.setattr(
+        tools.mcp_tool,
+        "discover_mcp_tools",
+        lambda: calls.append("called") or [],
+    )
+
+    compute_prompt_breakdown("cli")
+
+    assert calls == ["called"]
+
+
 def test_skills_block_regex_matches_tagged_block():
     text = "preamble\n<available_skills>\n  cat:\n    - a: b\n</available_skills>\ntail"
     m = _SKILLS_BLOCK_RE.search(text)

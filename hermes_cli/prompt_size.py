@@ -34,10 +34,20 @@ def _build_inspection_agent(platform: str) -> Any:
     """
     from run_agent import AIAgent
     from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _get_platform_tools
 
     cfg = load_config()
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+
+        discover_mcp_tools()
+    except Exception:
+        # prompt-size is diagnostic-only; report built-in prompt/tool size even
+        # when an MCP server is offline or slow to start.
+        pass
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
+    enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
 
     return AIAgent(
         model=model,
@@ -46,6 +56,7 @@ def _build_inspection_agent(platform: str) -> Any:
         quiet_mode=True,
         save_trajectories=False,
         platform=platform,
+        enabled_toolsets=enabled_toolsets,
     )
 
 
@@ -90,6 +101,12 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # Tool-schema JSON — the other half of the fixed per-call payload.
     tools = getattr(agent, "tools", None) or []
     tools_json = json.dumps(tools, ensure_ascii=False)
+    tool_names = [
+        (tool.get("function") or {}).get("name") or tool.get("name")
+        for tool in tools
+        if isinstance(tool, dict)
+    ]
+    tool_names = sorted(name for name in tool_names if name)
 
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
@@ -104,7 +121,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
-        "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+        "tools": {"count": len(tools), "json_bytes": _bytes(tools_json), "names": tool_names},
         "sections": sections,
     }
 

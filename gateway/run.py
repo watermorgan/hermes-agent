@@ -140,6 +140,136 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+_ATTACHMENT_INTENT_GATE_PLATFORMS = frozenset({"dingtalk", "feishu", "lark"})
+_BARE_ATTACHMENT_FILENAME_RE = re.compile(
+    r"^\s*[\w .()[\]{}@,+~=-]+\.(?:"
+    r"png|jpe?g|webp|gif|heic|heif|bmp|tiff?|"
+    r"pdf|docx?|xlsx?|pptx?|csv|tsv|txt|md|json|zip|rar|7z|pages|numbers|key"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_ATTACHMENT_PLACEHOLDER_LINE_RE = re.compile(
+    r"^\s*\[(?:the )?user sent (?:an? )?(?:image|file|document|audio|video|attachment).*\]\s*$",
+    re.IGNORECASE,
+)
+_ATTACHMENT_EXPLICIT_INTENT_RE = re.compile(
+    r"("
+    r"翻译|译成|总结|摘要|提取|抽取|识别|读取|分析|检查|审核|审校|校对|对比|比较|"
+    r"整理|生成|输出|转成|转为|转换|表格|excel|xlsx|csv|报价|订单|合同|装箱单|发给|发送|处理|看一下|看看|"
+    r"translate|summari[sz]e|extract|ocr|read|analy[sz]e|review|check|audit|compare|convert|"
+    r"table|spreadsheet|excel|csv|quote|invoice|contract|send|process"
+    r")",
+    re.IGNORECASE,
+)
+_ATTACHMENT_CONTEXT_HINT_RE = re.compile(
+    r"("
+    r"文件|附件|图片|照片|截图|扫描件|图|pdf|excel|xlsx?|csv|表格|bom|报价|合同|订单|PI|PL|"
+    r"上传|重发|重新发|再发|这个|这些|这份|这张|这两张|"
+    r"file|attachment|image|photo|screenshot|scan|document|spreadsheet|table|pdf|excel|"
+    r"upload|send|resend|this|these"
+    r")",
+    re.IGNORECASE,
+)
+_ATTACHMENT_INTENT_HISTORY_LOOKBACK = 8
+
+
+def _attachment_text_has_explicit_intent(text: str) -> bool:
+    """Return True when attachment caption text states an actionable task."""
+    if not isinstance(text, str):
+        return False
+    meaningful_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _ATTACHMENT_PLACEHOLDER_LINE_RE.match(stripped):
+            continue
+        if _BARE_ATTACHMENT_FILENAME_RE.match(stripped):
+            continue
+        meaningful_lines.append(stripped)
+    if not meaningful_lines:
+        return False
+    return bool(_ATTACHMENT_EXPLICIT_INTENT_RE.search("\n".join(meaningful_lines)))
+
+
+def _history_content_to_text(content: Any) -> str:
+    """Extract text from plain or multimodal history content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text") or item.get("content")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _recent_history_has_attachment_task_intent(history: list[dict[str, Any]] | None) -> bool:
+    """Return True when a recent user turn clearly set up the attachment task."""
+    for entry in reversed((history or [])[-_ATTACHMENT_INTENT_HISTORY_LOOKBACK:]):
+        if entry.get("role") != "user":
+            continue
+        text = _history_content_to_text(entry.get("content"))
+        if not _attachment_text_has_explicit_intent(text):
+            continue
+        if _ATTACHMENT_CONTEXT_HINT_RE.search(text):
+            return True
+    return False
+
+
+def _should_gate_ambiguous_attachment_intent(
+    event: Any,
+    source: Any,
+    history: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Gate bare Feishu/DingTalk attachments so the agent asks before processing."""
+    if _gateway_platform_value(getattr(source, "platform", None)) not in _ATTACHMENT_INTENT_GATE_PLATFORMS:
+        return False
+    media_urls = getattr(event, "media_urls", None) or []
+    if not media_urls:
+        return False
+    if _attachment_text_has_explicit_intent(getattr(event, "text", "") or ""):
+        return False
+    if _recent_history_has_attachment_task_intent(history):
+        return False
+    media_types = getattr(event, "media_types", None) or []
+    message_type = getattr(event, "message_type", None)
+    for i, _path in enumerate(media_urls):
+        media_type = media_types[i] if i < len(media_types) else ""
+        if media_type.startswith("audio/") or message_type == MessageType.VOICE:
+            continue
+        return True
+    return False
+
+
+def _build_attachment_intent_gate_note(event: Any) -> str:
+    """Build a prompt note that asks for intent without exposing attachment content."""
+    names: list[str] = []
+    for path in getattr(event, "media_urls", None) or []:
+        basename = os.path.basename(str(path))
+        parts = basename.split("_", 2)
+        display_name = parts[2] if len(parts) >= 3 else basename
+        display_name = re.sub(r"[^\w.\- ]", "_", display_name)
+        if display_name:
+            names.append(display_name)
+    if not names:
+        names.append("attachment")
+    label = "、".join(names[:3])
+    if len(names) > 3:
+        label += f" 等 {len(names)} 个附件"
+    return (
+        f"[The user sent attachment(s): {label}. They did not state what they want done. "
+        "Ask one concise clarification question before processing. "
+        "Do not analyze, translate, summarize, extract, or convert the attachment yet. "
+        "Offer likely options such as translation, summary, table/field extraction, Excel conversion, or review/check.]"
+    )
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -8480,6 +8610,9 @@ class GatewayRunner:
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
+
+        if _should_gate_ambiguous_attachment_intent(event, source, history):
+            return _build_attachment_intent_gate_note(event)
 
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
