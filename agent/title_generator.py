@@ -9,6 +9,7 @@ import threading
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from agent.think_scrubber import StreamingThinkScrubber
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,16 @@ _TITLE_PROMPT = (
     "following exchange. The title should capture the main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+
+def _clean_generated_title(text: str) -> str:
+    """Return a user-visible title from raw auxiliary model output."""
+    scrubber = StreamingThinkScrubber()
+    title = (scrubber.feed(text or "") + scrubber.flush()).strip()
+    title = title.strip('"\'')
+    if title.lower().startswith("title:"):
+        title = title[6:].strip()
+    return title
 
 
 def generate_title(
@@ -62,11 +73,8 @@ def generate_title(
             timeout=timeout,
             main_runtime=main_runtime,
         )
-        title = (response.choices[0].message.content or "").strip()
+        title = _clean_generated_title(response.choices[0].message.content or "")
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
-        title = title.strip('"\'')
-        if title.lower().startswith("title:"):
-            title = title[6:].strip()
         # Enforce reasonable length
         if len(title) > 80:
             title = title[:77] + "..."

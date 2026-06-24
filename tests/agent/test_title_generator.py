@@ -40,6 +40,19 @@ class TestGenerateTitle:
             title = generate_title("my pod keeps crashing", "Let me look...")
             assert title == "Kubernetes Pod Debugging"
 
+    def test_strips_think_blocks_from_reasoning_models(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "<think>The user is asking who the assistant is. "
+            "I should generate a concise title.</think>\n"
+            "Assistant Identity"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("你好，你是谁", "我是阿宝...")
+            assert title == "Assistant Identity"
+
     def test_truncates_long_titles(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
